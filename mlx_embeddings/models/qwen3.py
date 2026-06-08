@@ -30,8 +30,9 @@ def last_token_pool(
     if left_padding:
         return last_hidden_states[:, -1]
     else:
-        # Find the last valid token position for each sequence
-        sequence_lengths = attention_mask.sum(axis=1) - 1
+        # Find the last valid token position for each sequence (gather needs
+        # integer indices — the mask may be float).
+        sequence_lengths = (attention_mask.sum(axis=1) - 1).astype(mx.int32)
         batch_size = last_hidden_states.shape[0]
         return last_hidden_states[mx.arange(batch_size), sequence_lengths]
 
@@ -534,3 +535,36 @@ class Model(nn.Module):
             sanitized_weights[new_key] = value
 
         return sanitized_weights
+
+
+class ModelForSequenceClassification(nn.Module):
+    """Qwen3 decoder reranker (Qwen3ForSequenceClassification), e.g.
+    Qwen3-Reranker-0.6B-seq-cls. The causal decoder + a `score` linear on the
+    last non-pad token's hidden state; BaseModelOutput.scores = sigmoid(logit)
+    in [0,1] for a (query, passage) pair. Distinct from the bge xlm-roberta
+    cross-encoder — this is an LLM scored as a relevance classifier."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.model = Qwen3Model(config)
+        self.score = nn.Linear(config.hidden_size, 1, bias=False)
+
+    def __call__(self, input_ids, attention_mask=None):
+        if attention_mask is None:
+            attention_mask = mx.ones(input_ids.shape, dtype=mx.int32)
+        last_hidden_state = self.model(input_ids, attention_mask=attention_mask)
+        pooled = last_token_pool(last_hidden_state, attention_mask)
+        logits = self.score(pooled)          # [B, 1]
+        return BaseModelOutput(
+            last_hidden_state=last_hidden_state,
+            logits=logits,
+            scores=mx.sigmoid(logits[:, 0]),
+        )
+
+    def sanitize(self, weights):
+        # keep model.* and score.weight as-is; drop lm_head / rotary buffers
+        return {
+            k: v for k, v in weights.items()
+            if not k.endswith("lm_head.weight") and "rotary_emb.inv_freq" not in k
+        }
