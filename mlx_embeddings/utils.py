@@ -14,7 +14,6 @@ import mlx.nn as nn
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError
 from mlx.utils import tree_flatten
-from mlx_vlm.utils import sanitize_weights
 from transformers import AutoProcessor, PreTrainedTokenizer
 
 from .tokenizer_utils import TokenizerWrapper, load_tokenizer
@@ -53,6 +52,15 @@ def _get_classes(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     arch = _get_model_arch(config)
+
+    # Sequence-classification checkpoints (cross-encoder rerankers, e.g.
+    # bge-reranker) use a dedicated head; route to it when the module provides
+    # one and the checkpoint declares a *ForSequenceClassification architecture.
+    architectures = config.get("architectures") or []
+    if any("ForSequenceClassification" in a for a in architectures) and hasattr(
+        arch, "ModelForSequenceClassification"
+    ):
+        return arch.ModelForSequenceClassification, arch.ModelArgs, None, None
 
     if hasattr(arch, "TextConfig") and hasattr(arch, "VisionConfig"):
         return arch.Model, arch.ModelArgs, arch.TextConfig, arch.VisionConfig
@@ -215,14 +223,16 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
-    if hasattr(model_class, "VisionModel"):
-        weights = sanitize_weights(
-            model_class.VisionModel, weights, model_args.vision_config
-        )
-    if hasattr(model_class, "LanguageModel"):
-        weights = sanitize_weights(
-            model_class.LanguageModel, weights, model_args.text_config
-        )
+    if hasattr(model_class, "VisionModel") or hasattr(model_class, "LanguageModel"):
+        from mlx_vlm.utils import sanitize_weights  # vision deps only when needed
+        if hasattr(model_class, "VisionModel"):
+            weights = sanitize_weights(
+                model_class.VisionModel, weights, model_args.vision_config
+            )
+        if hasattr(model_class, "LanguageModel"):
+            weights = sanitize_weights(
+                model_class.LanguageModel, weights, model_args.text_config
+            )
 
     if "quantization" not in config:
         quantization_config = config.get("quantization_config", None)
