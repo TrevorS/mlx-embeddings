@@ -325,6 +325,30 @@ class TestModels(unittest.TestCase):
             text_embeds_is_sequence=False,
         )
 
+    def test_eurobert_model(self):
+        from mlx_embeddings.models import eurobert
+
+        config = eurobert.ModelArgs(
+            model_type="eurobert",
+            hidden_size=768,
+            num_hidden_layers=12,
+            intermediate_size=3072,
+            num_attention_heads=12,
+            num_key_value_heads=12,
+            head_dim=64,
+            max_position_embeddings=8192,
+            vocab_size=128256,
+            rms_norm_eps=1e-5,
+            rope_theta=1000000.0,
+        )
+        model = eurobert.Model(config)
+
+        self.model_test_runner(
+            model,
+            config.model_type,
+            config.num_hidden_layers,
+        )
+
     def test_siglip_model(self):
         from mlx_embeddings.models import siglip
 
