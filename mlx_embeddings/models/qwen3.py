@@ -568,3 +568,140 @@ class ModelForSequenceClassification(nn.Module):
             k: v for k, v in weights.items()
             if not k.endswith("lm_head.weight") and "rotary_emb.inv_freq" not in k
         }
+
+
+# Default special-token ids for jina-reranker-v3 (overridable via config).
+_JINA_DOC_EMBED_TOKEN_ID = 151670  # <|embed_token|>
+_JINA_QUERY_EMBED_TOKEN_ID = 151671  # <|rerank_token|>
+
+
+class JinaRankingProjector(nn.Module):
+    """MLP head that projects a backbone hidden state to the ranking embedding
+    space: Linear(hidden->proj) -> ReLU -> Linear(proj->proj), no bias.
+
+    Matches jina-reranker-v3's projector.safetensors (linear1/linear2)."""
+
+    def __init__(self, hidden_size: int, proj_dim: int = 512):
+        super().__init__()
+        self.linear1 = nn.Linear(hidden_size, proj_dim, bias=False)
+        self.linear2 = nn.Linear(proj_dim, proj_dim, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.linear2(nn.relu(self.linear1(x)))
+
+
+def _jina_rerank_prompt(query, docs, instruction=None):
+    """Build jina-reranker-v3's single listwise prompt: every passage ends with
+    <|embed_token|> and the query with <|rerank_token|>; their hidden states are
+    the pooled vectors that get projected and scored."""
+    prefix = (
+        "<|im_start|>system\n"
+        "You are a search relevance expert who can determine a ranking of the "
+        "passages based on how relevant they are to the query. If the query is a "
+        "question, how relevant a passage is depends on how well it answers the "
+        "question. If not, try to analyze the intent of the query and assess how "
+        "well each passage satisfies the intent. If an instruction is provided, "
+        "you should follow the instruction when determining the ranking."
+        "<|im_end|>\n<|im_start|>user\n"
+    )
+    suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    body = (
+        f"I will provide you with {len(docs)} passages, each indicated by a "
+        f"numerical identifier. Rank the passages based on their relevance to "
+        f"query: {query}\n"
+    )
+    if instruction:
+        body += f"<instruct>\n{instruction}\n</instruct>\n"
+    body += "\n".join(
+        f'<passage id="{i}">\n{doc}<|embed_token|>\n</passage>'
+        for i, doc in enumerate(docs)
+    )
+    body += f"\n<query>\n{query}<|rerank_token|>\n</query>"
+    return prefix + body + suffix
+
+
+class ModelForRanking(nn.Module):
+    """jina-reranker-v3 (JinaForRanking): a Qwen3 backbone + an MLP projector
+    used as a *listwise* reranker. The query and every document are packed into
+    one prompt; the hidden states at the <|rerank_token|>/<|embed_token|>
+    positions are projected to a shared space and the relevance score is the
+    cosine similarity between the query vector and each document vector.
+
+    Unlike the cross-encoder ``ModelForSequenceClassification`` (one (query,
+    passage) pair -> one logit), this scores all documents in a single forward
+    pass. Use ``model.rerank(query, documents, tokenizer)``. The projector
+    weights live in a separate ``projector.safetensors`` (keys linear1/linear2),
+    remapped onto ``projector.*`` by ``sanitize``."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.model = Qwen3Model(config)
+        self.projector = JinaRankingProjector(
+            config.hidden_size, getattr(config, "ranking_proj_dim", 512)
+        )
+        self.doc_embed_token_id = getattr(
+            config, "doc_embed_token_id", _JINA_DOC_EMBED_TOKEN_ID
+        )
+        self.query_embed_token_id = getattr(
+            config, "query_embed_token_id", _JINA_QUERY_EMBED_TOKEN_ID
+        )
+
+    def __call__(self, input_ids: mx.array, attention_mask=None) -> BaseModelOutput:
+        last_hidden_state = self.model(input_ids, attention_mask=attention_mask)
+        return BaseModelOutput(last_hidden_state=last_hidden_state)
+
+    def rerank(self, query, documents, tokenizer, top_n=None, instruction=None):
+        """Rank ``documents`` by relevance to ``query``.
+
+        Returns a list of dicts ``{document, relevance_score, index}`` sorted by
+        descending score (length ``top_n`` or all)."""
+        prompt = _jina_rerank_prompt(query, documents, instruction)
+        ids = tokenizer.encode(prompt, add_special_tokens=False)
+
+        last_hidden_state = self.model(mx.array([ids]))[0]  # [seq, hidden]
+
+        ids_arr = mx.array(ids)
+        doc_pos = [
+            i for i, t in enumerate(ids) if t == self.doc_embed_token_id
+        ]
+        qry_pos = [
+            i for i, t in enumerate(ids) if t == self.query_embed_token_id
+        ]
+        if not qry_pos:
+            raise ValueError("query embed token (<|rerank_token|>) not in prompt")
+        if not doc_pos:
+            raise ValueError("doc embed tokens (<|embed_token|>) not in prompt")
+        del ids_arr
+
+        # Project pooled hidden states; cast to projector dtype for precision.
+        pdtype = self.projector.linear1.weight.dtype
+        q_vec = self.projector(last_hidden_state[qry_pos[0]][None].astype(pdtype))  # [1, P]
+        d_vecs = self.projector(
+            mx.stack([last_hidden_state[p] for p in doc_pos]).astype(pdtype)
+        )  # [num_docs, P]
+
+        q_n = q_vec / (mx.linalg.norm(q_vec, axis=-1, keepdims=True) + 1e-9)
+        d_n = d_vecs / (mx.linalg.norm(d_vecs, axis=-1, keepdims=True) + 1e-9)
+        scores = (d_n @ q_n.T)[:, 0]  # [num_docs]
+        mx.eval(scores)
+
+        order = sorted(range(len(documents)), key=lambda i: -float(scores[i]))
+        if top_n is not None:
+            order = order[: min(top_n, len(order))]
+        return [
+            {"document": documents[i], "relevance_score": float(scores[i]), "index": i}
+            for i in order
+        ]
+
+    def sanitize(self, weights: dict) -> dict:
+        out = {}
+        for k, v in weights.items():
+            if k.endswith("lm_head.weight") or "rotary_emb.inv_freq" in k:
+                continue
+            # projector.safetensors ships bare linear1/linear2 keys.
+            if k in ("linear1.weight", "linear2.weight"):
+                out[f"projector.{k}"] = v
+            else:
+                out[k] = v
+        return out

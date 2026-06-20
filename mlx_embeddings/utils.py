@@ -62,6 +62,14 @@ def _get_classes(config: dict):
     ):
         return arch.ModelForSequenceClassification, arch.ModelArgs, None, None
 
+    # Listwise ranking checkpoints (e.g. jina-reranker-v3, architecture
+    # "JinaForRanking") pair a backbone with a projector head; route to it when
+    # the module provides one.
+    if any("ForRanking" in a for a in architectures) and hasattr(
+        arch, "ModelForRanking"
+    ):
+        return arch.ModelForRanking, arch.ModelArgs, None, None
+
     if hasattr(arch, "TextConfig") and hasattr(arch, "VisionConfig"):
         return arch.Model, arch.ModelArgs, arch.TextConfig, arch.VisionConfig
 
@@ -165,6 +173,12 @@ def load_model(
             config["pooling_config"] = pooling_cfg
 
     weight_files = glob.glob(str(model_path / "**/model*.safetensors"), recursive=True)
+
+    # Auxiliary heads shipped as a separate file (e.g. jina-reranker-v3's
+    # projector.safetensors); the model's sanitize() maps their keys into place.
+    weight_files += glob.glob(
+        str(model_path / "**/projector*.safetensors"), recursive=True
+    )
 
     if not weight_files:
         # Try weight for back-compat

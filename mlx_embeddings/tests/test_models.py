@@ -349,6 +349,44 @@ class TestModels(unittest.TestCase):
             config.num_hidden_layers,
         )
 
+    def test_qwen3_for_ranking(self):
+        from mlx_embeddings.models import qwen3
+
+        config = qwen3.ModelArgs(
+            model_type="qwen3",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=200,
+        )
+        model = qwen3.ModelForRanking(config)
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        # Projector head wired (hidden -> 512 -> 512 by default).
+        self.assertEqual(model.projector.linear1.weight.shape, (512, 64))
+        self.assertEqual(model.projector.linear2.weight.shape, (512, 512))
+
+        # Backbone forward returns a per-token hidden sequence.
+        out = model(mx.array([[1, 2, 3, 4, 5]]))
+        self.assertEqual(out.last_hidden_state.shape, (1, 5, 64))
+
+        # sanitize() remaps the standalone projector keys onto projector.*
+        san = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((200, 64)),
+                "linear1.weight": mx.zeros((512, 64)),
+                "linear2.weight": mx.zeros((512, 512)),
+                "lm_head.weight": mx.zeros((200, 64)),
+            }
+        )
+        self.assertIn("projector.linear1.weight", san)
+        self.assertIn("projector.linear2.weight", san)
+        self.assertNotIn("linear1.weight", san)
+        self.assertNotIn("lm_head.weight", san)
+
     def test_siglip_model(self):
         from mlx_embeddings.models import siglip
 
